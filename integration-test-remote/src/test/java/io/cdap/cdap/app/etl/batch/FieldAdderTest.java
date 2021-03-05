@@ -58,8 +58,6 @@ public class FieldAdderTest extends ETLTestBase {
 
   private static final ArtifactSelectorConfig CORE_PLUGINS_ARTIFACT =
     new ArtifactSelectorConfig("SYSTEM", "core-plugins", "[0.0.0, 100.0.0)");
-  private static final ArtifactSelectorConfig FIELD_ADDER_ARTIFACT =
-    new ArtifactSelectorConfig("SYSTEM", "field-adder", "[0.0.0, 100.0.0)");
 
   private static final String FILE_SOURCE_PLUGIN_NAME = "File";
   private static final String MULTI_FIELD_ADDER_PLUGIN_NAME = "MultiFieldAdder";
@@ -155,6 +153,7 @@ public class FieldAdderTest extends ETLTestBase {
   }
 
   private void multiFieldAdderConfig(Engine engine, String fieldValue, Map<String, String> args) throws Exception {
+    installPluginFromHub("hydrator-plugin-add-field-transform", "field-adder", "2.1.1");
     ETLStage source = getSourceStage();
     ETLStage transform = getTransformStage(fieldValue);
     ETLStage sink = getTableSink();
@@ -208,7 +207,7 @@ public class FieldAdderTest extends ETLTestBase {
                           ImmutableMap.of(
                             "fieldValue", fieldValue,
                             "inputSchema", INPUT_SCHEMA.toString()),
-                          FIELD_ADDER_ARTIFACT));
+                          null));
   }
 
   private ETLStage getTableSink() {
