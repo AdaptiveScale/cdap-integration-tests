@@ -16,64 +16,71 @@
 
 package io.cdap.cdap.app.etl.batch;
 
+import com.google.cloud.bigquery.BigQuery;
+import com.google.cloud.bigquery.Dataset;
+import com.google.cloud.bigquery.DatasetInfo;
+import com.google.cloud.bigquery.Field;
+import com.google.cloud.bigquery.FieldList;
+import com.google.cloud.bigquery.FieldValue;
+import com.google.cloud.bigquery.FieldValueList;
+import com.google.cloud.bigquery.LegacySQLTypeName;
+import com.google.cloud.bigquery.TableId;
+import com.google.cloud.bigquery.TableResult;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import io.cdap.cdap.api.common.Bytes;
+import com.google.gson.JsonObject;
 import io.cdap.cdap.api.data.schema.Schema;
-import io.cdap.cdap.api.dataset.table.Row;
-import io.cdap.cdap.api.dataset.table.Table;
-import io.cdap.cdap.app.etl.ETLTestBase;
-import io.cdap.cdap.datapipeline.SmartWorkflow;
+import io.cdap.cdap.app.etl.gcp.DataprocETLTestBase;
+import io.cdap.cdap.app.etl.gcp.GoogleBigQueryUtils;
+import io.cdap.cdap.common.ArtifactNotFoundException;
 import io.cdap.cdap.etl.api.Engine;
 import io.cdap.cdap.etl.api.Transform;
 import io.cdap.cdap.etl.api.batch.BatchSink;
 import io.cdap.cdap.etl.api.batch.BatchSource;
-import io.cdap.cdap.etl.proto.ArtifactSelectorConfig;
 import io.cdap.cdap.etl.proto.v2.ETLBatchConfig;
 import io.cdap.cdap.etl.proto.v2.ETLPlugin;
 import io.cdap.cdap.etl.proto.v2.ETLStage;
 import io.cdap.cdap.proto.ProgramRunStatus;
 import io.cdap.cdap.proto.artifact.AppRequest;
 import io.cdap.cdap.proto.id.ApplicationId;
-import io.cdap.cdap.security.authentication.client.AccessToken;
+import io.cdap.cdap.proto.id.ArtifactId;
 import io.cdap.cdap.test.ApplicationManager;
-import io.cdap.cdap.test.DataSetManager;
-import io.cdap.cdap.test.ServiceManager;
-import io.cdap.cdap.test.WorkflowManager;
-import io.cdap.common.http.HttpMethod;
-import io.cdap.common.http.HttpRequest;
-import io.cdap.common.http.HttpResponse;
-import io.cdap.plugin.common.Properties;
+import io.cdap.cdap.test.Tasks;
+import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.io.File;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 
-public class FieldAdderTest extends ETLTestBase {
+public class FieldAdderTest extends DataprocETLTestBase {
 
-  private static final ArtifactSelectorConfig CORE_PLUGINS_ARTIFACT =
-    new ArtifactSelectorConfig("SYSTEM", "core-plugins", "[0.0.0, 100.0.0)");
+  private static final Logger LOG = LoggerFactory.getLogger(DataprocETLTestBase.class);
 
-  private static final String FILE_SOURCE_PLUGIN_NAME = "File";
   private static final String MULTI_FIELD_ADDER_PLUGIN_NAME = "MultiFieldAdder";
-  private static final String TABLE_SINK_PLUGIN_NAME = "Table";
-  private static final String SINK_TABLE_NAME = "field-adder-sink";
+  private static final String BIG_QUERY_PLUGIN_NAME = "BigQueryTable";
+  private static final String SOURCE_TABLE_NAME_TEMPLATE = "test_source_table_";
+  private static final String SINK_TABLE_NAME_TEMPLATE = "test_sink_table_";
 
   private static final String NON_MACRO_FIELD_VALUE = "key1:value1,key2:value2";
   private static final String MACRO_FIELD_VALUE = "key1:${value1},${key2}:value2";
   private static final String WHOLE_MACRO_FIELD_VALUE = "${fieldValue}";
-
-  private String sourcePath;
-
   private static final Schema INPUT_SCHEMA = Schema.recordOf("record",
                                                              Schema.Field.of("id", Schema.of(Schema.Type.STRING)),
                                                              Schema.Field.of("name", Schema.of(Schema.Type.STRING)),
-                                                             Schema.Field.of("surname", Schema.of(Schema.Type.STRING)));
+                                                             Schema.Field.of("surname", Schema.of(Schema.Type.STRING))
+  );
+
   private static final Schema OUTPUT_SCHEMA =
     Schema.recordOf("output",
                     Schema.Field.of("id", Schema.of(Schema.Type.STRING)),
@@ -82,29 +89,102 @@ public class FieldAdderTest extends ETLTestBase {
                     Schema.Field.of("key1", Schema.nullableOf(Schema.of(Schema.Type.STRING))),
                     Schema.Field.of("key2", Schema.nullableOf(Schema.of(Schema.Type.STRING))));
 
+  private static final Field[] INPUT_FIELDS_SCHEMA = new Field[]{
+    Field.newBuilder("id", LegacySQLTypeName.STRING).setMode(Field.Mode.REQUIRED).build(),
+    Field.newBuilder("name", LegacySQLTypeName.STRING).setMode(Field.Mode.REQUIRED).build(),
+    Field.newBuilder("surname", LegacySQLTypeName.STRING).setMode(Field.Mode.REQUIRED).build(),
+  };
+
+  private static final Field[] EXPECTED_FIELDS_SCHEMA = new Field[]{
+    Field.newBuilder("id", LegacySQLTypeName.STRING).setMode(Field.Mode.REQUIRED).build(),
+    Field.newBuilder("name", LegacySQLTypeName.STRING).setMode(Field.Mode.REQUIRED).build(),
+    Field.newBuilder("surname", LegacySQLTypeName.STRING).setMode(Field.Mode.REQUIRED).build(),
+    Field.newBuilder("key1", LegacySQLTypeName.STRING).setMode(Field.Mode.NULLABLE).build(),
+    Field.newBuilder("key2", LegacySQLTypeName.STRING).setMode(Field.Mode.NULLABLE).build(),
+  };
+
+  private static final com.google.cloud.bigquery.Schema EXPECTED_BIG_QUERY_SCHEMA =
+    com.google.cloud.bigquery.Schema.of(EXPECTED_FIELDS_SCHEMA);
+  private static BigQuery bq;
+  private static String bigQueryDataset;
+  private static Dataset dataset;
+
+  @AfterClass
+  public static void testClassClear() {
+    deleteDatasets();
+  }
+
+  private static void createDataset() throws Exception {
+    UUID uuid = UUID.randomUUID();
+    bigQueryDataset = "bq_dataset_" + uuid.toString().replaceAll("-", "_");
+    bq = GoogleBigQueryUtils.getBigQuery(getProjectId(), getServiceAccountCredentials());
+    LOG.info("Creating dataset {}", bigQueryDataset);
+    DatasetInfo datasetInfo = DatasetInfo.newBuilder(bigQueryDataset).build();
+    dataset = bq.create(datasetInfo);
+    LOG.info("Created dataset {}", bigQueryDataset);
+  }
+
+  private static void deleteDatasets() {
+    LOG.info("Deleting dataset {}", bigQueryDataset);
+    boolean deleted = bq.delete(dataset.getDatasetId(), BigQuery.DatasetDeleteOption.deleteContents());
+    if (deleted) {
+      LOG.info("Deleted dataset {}", bigQueryDataset);
+    }
+  }
+
+  private static JsonObject getSimpleSource() {
+    JsonObject json = new JsonObject();
+    json.addProperty("id", "test_id");
+    json.addProperty("name", "test_name");
+    json.addProperty("surname", "test_surname");
+    return json;
+  }
+
+  private static List<FieldValueList> getExpectedValues() {
+    return ImmutableList.of(FieldValueList.of(
+      Arrays.asList(FieldValue.of(FieldValue.Attribute.PRIMITIVE, "test_id"),
+                    FieldValue.of(FieldValue.Attribute.PRIMITIVE, "test_name"),
+                    FieldValue.of(FieldValue.Attribute.PRIMITIVE, "test_surname"),
+                    FieldValue.of(FieldValue.Attribute.PRIMITIVE, "value1"),
+                    FieldValue.of(FieldValue.Attribute.PRIMITIVE, "value2")),
+      EXPECTED_FIELDS_SCHEMA));
+  }
+
+  public static List<FieldValueList> getResultTableData(BigQuery bq, TableId tableId,
+                                                        com.google.cloud.bigquery.Schema schema) {
+    TableResult tableResult = bq.listTableData(tableId, schema);
+    List<FieldValueList> result = new ArrayList<>();
+    tableResult.iterateAll().forEach(result::add);
+    return result;
+  }
+
   @Before
   public void testSetup() throws Exception {
-    ApplicationManager applicationManager = deployApplication(UploadFile.class);
-    String fileSetName = UploadFile.FileSetService.class.getSimpleName();
-    ServiceManager serviceManager = applicationManager.getServiceManager(fileSetName);
-    startAndWaitForRun(serviceManager, ProgramRunStatus.RUNNING);
-    URL serviceURL = serviceManager.getServiceURL(PROGRAM_START_STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    createDataset();
+  }
 
-    URL url = new URL(serviceURL, "fieldadder/create");
-    //POST request to create a new file set with name fieldadder.csv.
-    HttpResponse response = getRestClient().execute(HttpMethod.POST, url, getClientConfig().getAccessToken());
-    Assert.assertEquals(HttpURLConnection.HTTP_OK, response.getResponseCode());
+  @Override
+  protected void innerSetup() throws Exception {
+    Tasks.waitFor(true, () -> {
+      try {
+        final ArtifactId dataPipelineId = TEST_NAMESPACE.artifact("cdap-data-pipeline", version);
+        if (!GoogleBigQueryUtils
+          .bigQueryPluginExists(artifactClient, dataPipelineId, BatchSource.PLUGIN_TYPE,
+                                BIG_QUERY_PLUGIN_NAME)) {
+          return false;
+        }
+        return GoogleBigQueryUtils
+          .bigQueryPluginExists(artifactClient, dataPipelineId, BatchSink.PLUGIN_TYPE,
+                                BIG_QUERY_PLUGIN_NAME);
+      } catch (ArtifactNotFoundException e) {
+        return false;
+      }
+    }, 5, TimeUnit.MINUTES, 3, TimeUnit.SECONDS);
+  }
 
-    url = new URL(serviceURL, "fieldadder?path=fieldadder.csv");
-    //PUT request to upload the fieldadder.csv file, sent in the request body
-    getRestClient().execute(HttpRequest.put(url).withBody(new File("src/test/resources/fieldadder.csv"))
-                              .build(), getClientConfig().getAccessToken());
+  @Override
+  protected void innerTearDown() throws Exception {
 
-    URL pathServiceUrl = new URL(serviceURL, "fieldadder?path");
-    AccessToken accessToken = getClientConfig().getAccessToken();
-    HttpResponse sourceResponse = getRestClient().execute(HttpMethod.GET, pathServiceUrl, accessToken);
-    Assert.assertEquals(HttpURLConnection.HTTP_OK, sourceResponse.getResponseCode());
-    sourcePath = sourceResponse.getResponseBodyAsString();
   }
 
   @Test
@@ -114,11 +194,22 @@ public class FieldAdderTest extends ETLTestBase {
   }
 
   private void testMultiFieldAdderNonMacroValues(Engine engine) throws Exception {
+    String testId = GoogleBigQueryUtils.getUUID();
+    String sourceTableName = SOURCE_TABLE_NAME_TEMPLATE + testId;
+    String destinationTableName = SINK_TABLE_NAME_TEMPLATE + testId;
+
+    GoogleBigQueryUtils.createTestTable(bq, bigQueryDataset, sourceTableName, INPUT_FIELDS_SCHEMA);
+    GoogleBigQueryUtils.insertData(bq, dataset, sourceTableName, Collections.singletonList(getSimpleSource()));
+
     Map<String, String> args = new HashMap<>();
     args.put("schema", OUTPUT_SCHEMA.toString());
 
-    multiFieldAdderConfig(engine, NON_MACRO_FIELD_VALUE, args);
-    assertValues();
+    multiFieldAdderConfig(MULTI_FIELD_ADDER_PLUGIN_NAME + engine + "-nonMacroValues", sourceTableName,
+                          destinationTableName, engine, NON_MACRO_FIELD_VALUE, args);
+
+    Assert.assertNotNull(dataset.get(destinationTableName));
+    assertTableData(destinationTableName);
+    assertSchemaEquals(destinationTableName);
   }
 
   @Test
@@ -128,13 +219,24 @@ public class FieldAdderTest extends ETLTestBase {
   }
 
   private void testMultiFieldAdderMacroValues(Engine engine) throws Exception {
+    String testId = GoogleBigQueryUtils.getUUID();
+    String sourceTableName = SOURCE_TABLE_NAME_TEMPLATE + testId;
+    String destinationTableName = SINK_TABLE_NAME_TEMPLATE + testId;
+
+    GoogleBigQueryUtils.createTestTable(bq, bigQueryDataset, sourceTableName, INPUT_FIELDS_SCHEMA);
+    GoogleBigQueryUtils.insertData(bq, dataset, sourceTableName, Collections.singletonList(getSimpleSource()));
+
     Map<String, String> args = new HashMap<>();
     args.put("schema", OUTPUT_SCHEMA.toString());
     args.put("value1", "value1");
     args.put("key2", "key2");
 
-    multiFieldAdderConfig(engine, MACRO_FIELD_VALUE, args);
-    assertValues();
+    multiFieldAdderConfig(MULTI_FIELD_ADDER_PLUGIN_NAME + engine + "-macroValues", sourceTableName,
+                          destinationTableName, engine, MACRO_FIELD_VALUE, args);
+
+    Assert.assertNotNull(dataset.get(destinationTableName));
+    assertTableData(destinationTableName);
+    assertSchemaEquals(destinationTableName);
   }
 
   @Test
@@ -144,58 +246,59 @@ public class FieldAdderTest extends ETLTestBase {
   }
 
   private void testMultiFieldAdderWholeMacroValue(Engine engine) throws Exception {
+    String testId = GoogleBigQueryUtils.getUUID();
+    String sourceTableName = SOURCE_TABLE_NAME_TEMPLATE + testId;
+    String destinationTableName = SINK_TABLE_NAME_TEMPLATE + testId;
+
+    GoogleBigQueryUtils.createTestTable(bq, bigQueryDataset, sourceTableName, INPUT_FIELDS_SCHEMA);
+    GoogleBigQueryUtils.insertData(bq, dataset, sourceTableName, Collections.singletonList(getSimpleSource()));
+
     Map<String, String> args = new HashMap<>();
     args.put("schema", OUTPUT_SCHEMA.toString());
     args.put("fieldValue", NON_MACRO_FIELD_VALUE);
 
-    multiFieldAdderConfig(engine, WHOLE_MACRO_FIELD_VALUE, args);
-    assertValues();
+    multiFieldAdderConfig(MULTI_FIELD_ADDER_PLUGIN_NAME + engine + "-wholeMacroValues", sourceTableName,
+                          destinationTableName, engine, WHOLE_MACRO_FIELD_VALUE, args);
+
+    Assert.assertNotNull(dataset.get(destinationTableName));
+    assertTableData(destinationTableName);
+    assertSchemaEquals(destinationTableName);
   }
 
-  private void multiFieldAdderConfig(Engine engine, String fieldValue, Map<String, String> args) throws Exception {
+  private void multiFieldAdderConfig(String applicationName, String sourceTableName, String destinationTableName,
+                                     Engine engine, String fieldValue, Map<String, String> args) throws Exception {
     installPluginFromHub("hydrator-plugin-add-field-transform", "field-adder", "2.1.1");
-    ETLStage source = getSourceStage();
+
+    ETLStage source = getSourceStage(sourceTableName);
     ETLStage transform = getTransformStage(fieldValue);
-    ETLStage sink = getTableSink();
-    ETLBatchConfig.Builder pipelineConfig = ETLBatchConfig.builder()
+    ETLStage sink = getBigQuerySink(destinationTableName);
+    ETLBatchConfig pipelineConfig = ETLBatchConfig.builder()
+      .setEngine(engine)
       .addStage(source)
       .addStage(transform)
       .addStage(sink)
       .addConnection(source.getName(), transform.getName())
-      .addConnection(transform.getName(), sink.getName());
-    pipelineConfig.setEngine(engine);
+      .addConnection(transform.getName(), sink.getName())
+      .build();
 
-    AppRequest<ETLBatchConfig> appRequest = getBatchAppRequestV2(pipelineConfig.build());
-    ApplicationId appId = TEST_NAMESPACE.app("MultiFieldAdder");
+    AppRequest<ETLBatchConfig> appRequest = getBatchAppRequestV2(pipelineConfig);
+    ApplicationId appId = TEST_NAMESPACE.app(applicationName);
     ApplicationManager appManager = deployApplication(appId, appRequest);
 
-    WorkflowManager workflowManager = appManager.getWorkflowManager(SmartWorkflow.NAME);
-    startAndWaitForRun(workflowManager, ProgramRunStatus.COMPLETED, args);
+    startWorkFlow(appManager, ProgramRunStatus.COMPLETED, args);
   }
 
-  private void assertValues() throws Exception {
-    DataSetManager<Table> outputManager = getTableDataset(SINK_TABLE_NAME);
-    Table outputTable = outputManager.get();
-    Row row = outputTable.get(Bytes.toBytes("1"));
-    Assert.assertEquals(4, row.getColumns().size());
-    Assert.assertNotNull(row.getString("key1"));
-    Assert.assertEquals("value1", row.getString("key1"));
-    Assert.assertNotNull(row.getString("key2"));
-    Assert.assertEquals("value2", row.getString("key2"));
-  }
-
-  private ETLStage getSourceStage() {
-    return new ETLStage("source",
-                        new ETLPlugin(
-                          FILE_SOURCE_PLUGIN_NAME,
-                          BatchSource.PLUGIN_TYPE,
-                          ImmutableMap.of(
-                            "referenceName", "file_source",
-                            "schema", INPUT_SCHEMA.toString(),
-                            "format", "csv",
-                            "skipHeader", "true",
-                            "path", sourcePath),
-                          CORE_PLUGINS_ARTIFACT));
+  private ETLStage getSourceStage(String sourceTableName) {
+    Map<String, String> sourceProps = new ImmutableMap.Builder<String, String>()
+      .put("referenceName", "bigQuery_source")
+      .put("project", getProjectId())
+      .put("dataset", bigQueryDataset)
+      .put("table", sourceTableName)
+      .put("schema", INPUT_SCHEMA.toString())
+      .build();
+    return new ETLStage("BigQuerySourceStage",
+                        new ETLPlugin(BIG_QUERY_PLUGIN_NAME, BatchSource.PLUGIN_TYPE, sourceProps,
+                                      GOOGLE_CLOUD_ARTIFACT));
 
   }
 
@@ -210,17 +313,62 @@ public class FieldAdderTest extends ETLTestBase {
                           null));
   }
 
-  private ETLStage getTableSink() {
-    return new ETLStage(
-      "TableSink",
-      new ETLPlugin(
-        TABLE_SINK_PLUGIN_NAME,
-        BatchSink.PLUGIN_TYPE,
-        ImmutableMap.of(
-          Properties.BatchReadableWritable.NAME, SINK_TABLE_NAME,
-          Properties.Table.PROPERTY_SCHEMA_ROW_FIELD, "id",
-          Properties.Table.PROPERTY_SCHEMA, "${schema}"
-        ),
-        CORE_PLUGINS_ARTIFACT));
+  private ETLStage getBigQuerySink(String tableName) {
+    Map<String, String> props = new ImmutableMap.Builder<String, String>()
+      .put("referenceName", "bigQuery_sink")
+      .put("project", getProjectId())
+      .put("dataset", bigQueryDataset)
+      .put("table", tableName)
+      .put("operation", "INSERT")
+      .put("schema", "${schema}")
+      .put("allowSchemaRelaxation", "false")
+      .build();
+
+    return new ETLStage("BigQuerySinkStage",
+                        new ETLPlugin(BIG_QUERY_PLUGIN_NAME, BatchSink.PLUGIN_TYPE, props, GOOGLE_CLOUD_ARTIFACT));
+  }
+
+  private void assertSchemaEquals(String tableName) {
+    TableId tableId = TableId.of(bigQueryDataset, tableName);
+    com.google.cloud.bigquery.Schema actualSchema = bq.getTable(tableId).getDefinition().getSchema();
+
+    assert actualSchema != null;
+    Assert.assertEquals(EXPECTED_BIG_QUERY_SCHEMA.getFields().size(), actualSchema.getFields().size());
+
+    FieldList expectedFieldList = EXPECTED_BIG_QUERY_SCHEMA.getFields();
+    FieldList actualFieldList = actualSchema.getFields();
+    IntStream.range(0, expectedFieldList.size()).forEach(i -> {
+      Field expected = expectedFieldList.get(i);
+      Field actual = actualFieldList.get(i);
+      String fieldName = expected.getName();
+      String message = String.format("Values differ for field '%s'.", fieldName);
+      if (expected.getType() == LegacySQLTypeName.DATETIME) {
+        Assert.assertEquals(message, actual.getType(), LegacySQLTypeName.STRING);
+      } else {
+        Assert.assertEquals(message, expected, actual);
+      }
+    });
+  }
+
+  public void assertTableData(String tableName) {
+    List<FieldValueList> expectedResult = getExpectedValues();
+    TableId actualTableId = TableId.of(bigQueryDataset, tableName);
+    com.google.cloud.bigquery.Schema actualSchema = bq.getTable(actualTableId).getDefinition().getSchema();
+    List<FieldValueList> actualResult = getResultTableData(bq, actualTableId, actualSchema);
+    Assert.assertEquals(String.format("Expected row count '%d', actual row count '%d'.", expectedResult.size(),
+                                      actualResult.size()), expectedResult.size(), actualResult.size());
+
+    for (int i = 0; i < expectedResult.size(); i++) {
+      FieldValueList expectedFieldValueList = expectedResult.get(i);
+      FieldValueList actualFieldValueList = actualResult.get(i);
+      Arrays.stream(EXPECTED_FIELDS_SCHEMA).map(Field::getName)
+        .forEach(fieldName -> {
+          FieldValue expected = expectedFieldValueList.get(fieldName);
+          FieldValue actual = actualFieldValueList.get(fieldName);
+          String message = String.format("Values differ for field '%s'. Expected '%s' but was '%s'.",
+                                         fieldName, expected, actual);
+          Assert.assertEquals(message, expected, actual);
+        });
+    }
   }
 }
